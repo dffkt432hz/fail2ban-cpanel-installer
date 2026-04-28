@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""
+fail2ban-cpanel-installer
+=========================
+Automated security stack installer for cPanel / AlmaLinux 8+ / Apache VPS.
+
+Installs and configures:
+  - ipset (hash:net blocklist, 500k entries, iptables DROP rule)
+  - Fail2ban with 7 hardened jails
+  - Firehol Level 1 blocklist (4,400+ malicious networks, daily cron)
+  - Apache URL blocking (webshell/scanner paths, 403 before PHP spawns)
+  - WP-Cron server-side replacement (prevents cron storms under attack)
+
+Usage:
+  python3 security_installer.py [--step N] [--dry-run]
+
+Tested on:
+  AlmaLinux 8.10 / cPanel 11.134 / Apache 2.4 / Fail2ban 1.0.2
+
+Author: Andrei Ghițan (dffkt432hz)
+License: MIT
+"""
+
+import os
+import sys
+import subprocess
+import glob
+import time
+import argparse
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+RED    = "\033[91m"
+CYAN   = "\033[96m"
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+
+DRY_RUN = False
+
+def ok(msg):   print(f"{GREEN}  ✅ {msg}{RESET}")
+def warn(msg): print(f"{YELLOW}  ⚠️  {msg}{RESET}")
+def err(msg):  print(f"{RED}  ❌ {msg}{RESET}")
+def info(msg): print(f"{CYAN}  →  {msg}{RESET}")
+def head(msg): print(f"\n{BOLD}{CYAN}{'═'*60}{RESET}\n{BOLD}  {msg}{RESET}\n{BOLD}{CYAN}{'═'*60}{RESET}")
+def dry(msg):  print(f"{YELLOW}  [DRY-RUN] {msg}{RESET}")
+
+def run(cmd, check=True, capture=False):
+    if DRY_RUN:
+        dry(cmd)
+        class R: returncode=0; stdout=""; stderr=""
+        return R()
+    result = subprocess.run(cmd, shell=True, capture_output=capture, text=True)
+    if check and result.returncode != 0:
+        err(f"Command failed: {cmd}")
+        if capture and result.stderr:
+            err(result.stderr.strip())
+    return result
+
+def write_file(path, content, mode=0o644):
+    if DRY_RUN:
+        dry(f"Write: {path}")
+        return
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(content)
+    os.chmod(path, mode)
+    ok(f"Written: {path}")
+
+def append_if_missing(path, line):
+    try:
+        with open(path, 'r') as f:
+            if line.strip() in f.read():
+                warn(f"Already present in {path}: {line.strip()}")
+                return
+    except FileNotFoundError:
+        pass
+    if DRY_RUN:
+        dry(f"Append to {path}: {line.strip()}")
+        return
+    with open(path, 'a') as f:
+        f.write(f"\n{line}\n")
+    ok(f"Appended to {path}: {line.strip()}")
+
+# ── Path detection ────────────────────────────────────────────────────────────
+def detect_apache_log():
+    for p in [
+        "/usr/local/apache/logs/access_log",   # cPanel default
+        "/etc/apache2/logs/access_log",
+        "/var/log/apache2/access.log",
+        "/var/log/httpd/access_log",
+    ]:
+        if os.path.exists(p):
+            return p
+    return "/usr/local/apache/logs/access_log"
+
+def detect_apache_conf():
+    for p in ["/etc/apache2/conf/httpd.conf", "/etc/httpd/conf/httpd.conf"]:
+        if os.path.exists(p):
+            return p
+    return "/etc/apache2/conf/httpd.conf"
+
+def detect_apache_confd():
+    for p in ["/etc/apache2/conf.d", "/etc/httpd/conf.d"]:
+        if os.path.exists(p):
+            return p
+    return "/etc/apache2/conf.d"
+
+def detect_domlog_base():
+    for p in ["/etc/apache2/logs/domlogs", "/usr/local/apache/logs/domlogs"]:
+        if os.path.exists(p):
+            return p
+    return "/etc/apache2/logs/domlogs"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 1 — ipset + iptables
+# ─────────────────────────────────────────────────────────────────────────────
+def step1_ipset():
+    head("STEP 1 — ipset + iptables")
+
+    run("yum install -y ipset ipset-service")
+    run("systemctl enable ipset")
+    run("systemctl start ipset")
+
+    result = run("ipset list blocklist", check=False, capture=True)
+    if result.returncode != 0:
+        run("ipset create blocklist hash:net maxelem 500000")
+        ok("Created ipset blocklist")
+    else:
+        warn("ipset blocklist already exists — skipping creation")
+
+    result = run("iptables -L INPUT -n | grep blocklist", check=False, capture=True)
+    if "blocklist" not in result.stdout:
+        run("iptables -I INPUT 1 -i lo -j ACCEPT")
+        run("iptables -I INPUT 2 -s 127.0.0.0/8 -j ACCEPT")
+        run("iptables -I INPUT 3 -s 10.0.0.0/8 -j ACCEPT")
+        run("iptables -A INPUT -m set --match-set blocklist src -j DROP")
+        ok("iptables DROP rule added")
+    else:
+        warn("iptables blocklist rule already present")
+
+    run("iptables-save > /etc/sysconfig/iptables")
+    ok("iptables rules saved")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 2 — Fail2ban install
+# ─────────────────────────────────────────────────────────────────────────────
+def step2_fail2ban_install():
+    head("STEP 2 — Fail2ban Install")
+    run("yum install -y fail2ban")
+    run("systemctl enable fail2ban")
+    ok("Fail2ban installed and enabled")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 3 — Fail2ban filters (6 filter files)
+# ─────────────────────────────────────────────────────────────────────────────
+def step3_filters():
+    head("STEP 3 — Fail2ban Filters")
+
+    filters = {
+
+        "apache-webshell": """\
+[Definition]
+failregex = ^<HOST> -.*"(GET|POST|HEAD) .*\\.(php|asp|aspx|jsp|cgi|pl|py|sh|bash|cmd|exe|cfm|shtml)\\?.*= HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) .*(shell|webshell|cmd|eval|base64|passwd|shadow|etc/passwd) HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) .*(c99|r57|b374k|wso|alfa|indoxploit|symlink|bypass) HTTP
+ignoreregex =
+""",
+
+        "apache-php-scanner": """\
+[Definition]
+failregex = ^<HOST> -.*"(GET|POST) /.*.php.* HTTP/.*" 404
+            ^<HOST> -.*"(GET|POST) /wp-content/plugins/.*.php HTTP
+            ^<HOST> -.*"(GET|POST) /wp-includes/.*.php HTTP
+ignoreregex = ^<HOST> -.*"GET /wp-admin/
+              ^<HOST> -.*"GET /wp-content/themes/.*\\.php HTTP
+""",
+
+        "apache-credentials": """\
+[Definition]
+failregex = ^<HOST> -.*"(GET|POST|HEAD) /\\.env HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(wp-config\\.php|wp-config\\.bak|wp-config\\.txt) HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /\\.git/(config|HEAD|index) HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(aws|\\.aws)/credentials HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /\\.ssh/(id_rsa|authorized_keys|known_hosts) HTTP
+ignoreregex =
+""",
+
+        "apache-enum": """\
+[Definition]
+failregex = ^<HOST> -.*"(GET|POST|HEAD) .*(admin|administrator|phpmyadmin|pma|myadmin|mysql|adminer) HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /xmlrpc\\.php HTTP
+ignoreregex = ^<HOST> -.*"(GET|POST) /wp-admin/
+""",
+
+        "apache-config-scan": """\
+[Definition]
+# Targets JSON config file harvesting with rotating user agents (Bloom.host attack pattern)
+failregex = ^<HOST> -.*"(GET|POST|HEAD) /\\.dbeaver/credentials-config\\.json HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(aws|mysql|db|postgres|mongodb|s3|secrets?|credentials?|keys)/config\\.json HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(aws|mysql)/credentials(\\.json)? HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /config\\.(prod|dev|staging|production)\\.json HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /assets/config\\.production\\.json HTTP
+ignoreregex = ^<HOST> -.*"GET /wp-json/
+              ^<HOST> -.*"GET /wp-content/
+              ^<HOST> -.*"GET /wp-admin/
+""",
+
+        "apache-wplogin": """\
+[Definition]
+# wp-login.php brute force — watches all hosted domains via jail glob
+failregex = ^<HOST> -.*"POST /wp-login\\.php
+ignoreregex =
+""",
+
+    }
+
+    for name, content in filters.items():
+        path = f"/etc/fail2ban/filter.d/{name}.conf"
+        if os.path.exists(path) and not DRY_RUN:
+            warn(f"Filter exists: {path} — skipping (delete manually to reinstall)")
+        else:
+            write_file(path, content)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 4 — Fail2ban jail.local (7 jails)
+# ─────────────────────────────────────────────────────────────────────────────
+def step4_jails():
+    head("STEP 4 — Fail2ban Jails (jail.local)")
+
+    apache_log   = detect_apache_log()
+    domlog_base  = detect_domlog_base()
+    info(f"Apache log detected: {apache_log}")
+    info(f"Domlog base detected: {domlog_base}")
+
+    exts = ["ro", "com", "net", "art", "uk", "dev", "es"]
+    wplogin_logpath_lines = [f"logpath = {domlog_base}/*.{exts[0]}"]
+    for ext in exts[1:]:
+        wplogin_logpath_lines.append(f"           {domlog_base}/*.{ext}")
+    wplogin_logpath = "\n".join(wplogin_logpath_lines)
+
+    jail_local = f"""\
+# fail2ban-cpanel-installer — jail.local
+# Generated by security_installer.py
+# https://github.com/dffkt432hz/fail2ban-cpanel-installer
+
+[DEFAULT]
+bantime  = 86400
+findtime = 600
+maxretry = 5
+backend  = auto
+
+# ── SSH ───────────────────────────────────────────────────────────────────────
+[sshd]
+enabled  = true
+port     = ssh
+logpath  = /var/log/secure
+maxretry = 3
+
+# ── Webshell scanning ─────────────────────────────────────────────────────────
+[apache-webshell]
+enabled  = true
+port     = http,https
+filter   = apache-webshell
+logpath  = {apache_log}
+maxretry = 2
+findtime = 60
+bantime  = 86400
+action   = iptables-multiport[name=webshell, port="http,https", protocol=tcp]
+
+# ── PHP scanner (404 probing for vulnerable plugins/themes) ───────────────────
+[apache-php-scanner]
+enabled  = true
+port     = http,https
+filter   = apache-php-scanner
+logpath  = {apache_log}
+maxretry = 1
+findtime = 60
+bantime  = 86400
+action   = iptables-multiport[name=phpscanner, port="http,https", protocol=tcp]
+
+# ── Credential harvesting (.env, wp-config, .git, aws/credentials) ───────────
+[apache-credentials]
+enabled  = true
+port     = http,https
+filter   = apache-credentials
+logpath  = {apache_log}
+maxretry = 2
+findtime = 60
+bantime  = 86400
+action   = iptables-multiport[name=credentials, port="http,https", protocol=tcp]
+
+# ── Admin enumeration (phpmyadmin, xmlrpc, adminer) ──────────────────────────
+[apache-enum]
+enabled  = true
+port     = http,https
+filter   = apache-enum
+logpath  = {apache_log}
+maxretry = 5
+findtime = 60
+bantime  = 86400
+action   = iptables-multiport[name=enum, port="http,https", protocol=tcp]
+
+# ── JSON config file harvesting ───────────────────────────────────────────────
+[apache-config-scan]
+enabled  = true
+port     = http,https
+filter   = apache-config-scan
+logpath  = {apache_log}
+maxretry = 5
+findtime = 60
+bantime  = 86400
+action   = iptables-multiport[name=configscan, port="http,https", protocol=tcp]
+
+# ── WordPress wp-login.php brute force (all hosted domains) ──────────────────
+[apache-wplogin]
+enabled  = true
+port     = http,https
+filter   = apache-wplogin
+{wplogin_logpath}
+maxretry = 3
+findtime = 60
+bantime  = 86400
+action   = iptables-multiport[name=wplogin, port="http,https", protocol=tcp]
+"""
+
+    jail_path = "/etc/fail2ban/jail.local"
+    if os.path.exists(jail_path) and not DRY_RUN:
+        backup = f"{jail_path}.bak.{int(time.time())}"
+        run(f"cp {jail_path} {backup}")
+        warn(f"Existing jail.local backed up → {backup}")
+
+    write_file(jail_path, jail_local)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 5 — Firehol Level 1 blocklist
+# ─────────────────────────────────────────────────────────────────────────────
+def step5_firehol():
+    head("STEP 5 — Firehol Blocklist")
+
+    script = """\
+#!/bin/bash
+# Firehol Level 1 blocklist loader
+# https://github.com/dffkt432hz/fail2ban-cpanel-installer
+set -euo pipefail
+
+TMPFILE=$(mktemp)
+LOGFILE=/var/log/firehol-blocklist.log
+
+echo "[$(date)] Updating Firehol blocklist..." >> "$LOGFILE"
+
+curl -s https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset \\
+  | grep -v "^#" | grep -v "^$" > "$TMPFILE"
+
+COUNT=$(wc -l < "$TMPFILE")
+
+while IFS= read -r subnet; do
+    ipset add blocklist "$subnet" 2>/dev/null || true
+done < "$TMPFILE"
+
+rm "$TMPFILE"
+echo "[$(date)] Done. Loaded $COUNT networks." >> "$LOGFILE"
+"""
+    write_file("/usr/local/bin/firehol-blocklist.sh", script, mode=0o755)
+
+    info("Downloading Firehol blocklist (may take 1–2 minutes)...")
+    run("/usr/local/bin/firehol-blocklist.sh")
+    ok("Firehol blocklist loaded")
+
+    cron = "0 3 * * * root /usr/local/bin/firehol-blocklist.sh\n"
+    write_file("/etc/cron.d/firehol-blocklist", cron)
+
+    service = """\
+[Unit]
+Description=Firehol Blocklist Loader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/firehol-blocklist.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+    write_file("/etc/systemd/system/firehol-blocklist.service", service)
+    run("systemctl daemon-reload")
+    run("systemctl enable firehol-blocklist.service")
+    ok("Firehol systemd service enabled (loads on boot)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 6 — Apache URL blocking
+# ─────────────────────────────────────────────────────────────────────────────
+def step6_apache_blocking():
+    head("STEP 6 — Apache URL Blocking")
+
+    confd      = detect_apache_confd()
+    conf_path  = os.path.join(confd, "block-scanners.conf")
+    apache_conf = detect_apache_conf()
+
+    scanner_conf = """\
+# block-scanners.conf
+# Blocks known attack paths at Apache level — before PHP spawns processes.
+# Critical during attacks: prevents php-fpm worker exhaustion.
+# https://github.com/dffkt432hz/fail2ban-cpanel-installer
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # Block known webshell/plugin exploit names
+    RewriteCond %{REQUEST_URI} (hellopress|wp-file-manager|adminer|phpspy|c99|r57|alfa|wso|timthumb|FilesMan) [NC]
+    RewriteRule .* - [F,L]
+</IfModule>
+
+# Block specific webshell filenames
+<LocationMatch "\\.php$">
+    <If "%{REQUEST_URI} =~ /wso112233|ALFA_DATA|repeater|vuln|zoko|yasnu|xmu|uwu|uwa|solo1|spawns|pucci|puc|ref|one|t3s|sghb|ms-edit|wp-blog|wp-good|classwithtostring|adminfuns/">
+        Require all denied
+    </If>
+</LocationMatch>
+
+# Block status endpoints
+<Location "/whm-server-status">
+    Require all denied
+</Location>
+
+# Block specific known-bad plugin paths
+<Location "/wp-content/plugins/hellopress/wp_filemanager.php">
+    Require all denied
+</Location>
+"""
+
+    write_file(conf_path, scanner_conf)
+    append_if_missing(apache_conf, f"Include {conf_path}")
+
+    result = run("apachectl configtest", check=False, capture=True)
+    if result.returncode == 0:
+        ok("Apache config test passed")
+        run("service httpd restart || systemctl restart apache2 || true")
+        ok("Apache restarted")
+    else:
+        err("Apache config test FAILED — check /etc/apache2/conf.d/block-scanners.conf")
+        if result.stderr:
+            err(result.stderr.strip())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 7 — WP-Cron server-side replacement
+# ─────────────────────────────────────────────────────────────────────────────
+def step7_wp_cron():
+    head("STEP 7 — WP-Cron Hardening")
+
+    wp_configs = glob.glob("/home/*/public_html/wp-config.php")
+    info(f"Found {len(wp_configs)} WordPress installations")
+
+    cron_lines = []
+    patched = skipped = 0
+
+    for config_path in wp_configs:
+        parts = config_path.split("/")
+        user   = parts[2]
+        wp_dir = os.path.dirname(config_path)
+
+        if not DRY_RUN:
+            with open(config_path, 'r') as f:
+                content = f.read()
+
+            if "DISABLE_WP_CRON" not in content:
+                new_content = content.replace(
+                    "<?php",
+                    "<?php\ndefine('DISABLE_WP_CRON', true);",
+                    1
+                )
+                with open(config_path, 'w') as f:
+                    f.write(new_content)
+                ok(f"Patched: {config_path}")
+                patched += 1
+            else:
+                warn(f"Already patched: {config_path}")
+                skipped += 1
+        else:
+            dry(f"Would patch DISABLE_WP_CRON: {config_path}")
+
+        wp_cron = os.path.join(wp_dir, "wp-cron.php")
+        if os.path.exists(wp_cron) or DRY_RUN:
+            cron_lines.append(
+                f"*/5 * * * * {user} /usr/local/bin/php {wp_cron} > /dev/null 2>&1"
+            )
+
+    if not DRY_RUN:
+        info(f"Patched: {patched} | Already done: {skipped}")
+
+    if cron_lines:
+        content = "# WP-Cron server-side replacement\n# Generated by fail2ban-cpanel-installer\n"
+        content += "\n".join(cron_lines) + "\n"
+        write_file("/etc/cron.d/wp-cron-all", content)
+        ok(f"Server-side WP cron written ({len(cron_lines)} sites)")
+    else:
+        warn("No WP installations found — /etc/cron.d/wp-cron-all not created")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 8 — Start Fail2ban + verify jails
+# ─────────────────────────────────────────────────────────────────────────────
+def step8_start_fail2ban():
+    head("STEP 8 — Start & Verify Fail2ban")
+    run("systemctl restart fail2ban")
+    if not DRY_RUN:
+        time.sleep(5)
+    result = run("fail2ban-client status", check=False, capture=True)
+    if result.returncode == 0:
+        ok("Fail2ban running")
+        print(result.stdout)
+    else:
+        err("Fail2ban failed to start")
+        err("Check: journalctl -u fail2ban -n 50")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 9 — Final verification
+# ─────────────────────────────────────────────────────────────────────────────
+def step9_verify():
+    head("STEP 9 — Final Verification")
+
+    checks = [
+        ("ipset blocklist",          "ipset list blocklist | grep 'Number of entries'"),
+        ("iptables DROP rule",        "iptables -L INPUT -n -v | grep blocklist"),
+        ("Fail2ban jails",            "fail2ban-client status"),
+        ("Firehol cron",              "cat /etc/cron.d/firehol-blocklist"),
+        ("Apache URL blocking",       "curl -s -o /dev/null -w '%{http_code}' http://localhost/whm-server-status"),
+        ("WP-Cron server cron",       "wc -l /etc/cron.d/wp-cron-all 2>/dev/null || echo 'not created'"),
+    ]
+
+    all_ok = True
+    for label, cmd in checks:
+        result = run(cmd, check=False, capture=True)
+        if result.returncode == 0 and result.stdout.strip():
+            ok(f"{label}")
+            info(result.stdout.strip()[:200])
+        else:
+            warn(f"{label} — check manually")
+            all_ok = False
+
+    return all_ok
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+STEPS = [
+    ("ipset + iptables",        step1_ipset),
+    ("Fail2ban install",        step2_fail2ban_install),
+    ("Fail2ban filters",        step3_filters),
+    ("Fail2ban jails",          step4_jails),
+    ("Firehol blocklist",       step5_firehol),
+    ("Apache URL blocking",     step6_apache_blocking),
+    ("WP-Cron hardening",       step7_wp_cron),
+    ("Start Fail2ban",          step8_start_fail2ban),
+    ("Final verification",      step9_verify),
+]
+
+BANNER = f"""\
+{BOLD}{CYAN}
+╔══════════════════════════════════════════════════════════════╗
+║   fail2ban-cpanel-installer                                  ║
+║   Automated VPS Security Stack for cPanel / AlmaLinux        ║
+║   github.com/dffkt432hz/fail2ban-cpanel-installer            ║
+╚══════════════════════════════════════════════════════════════╝
+{RESET}
+Installs:
+  • ipset blocklist (500k entry capacity, iptables DROP)
+  • Fail2ban with 7 hardened jails
+      apache-webshell | apache-php-scanner | apache-credentials
+      apache-enum | apache-config-scan | apache-wplogin | sshd
+  • Firehol Level 1 blocklist (4,400+ malicious networks)
+  • Apache URL blocking (webshell/scanner paths → 403)
+  • WP-Cron server-side replacement (prevents cron storms)
+"""
+
+def main():
+    global DRY_RUN
+
+    parser = argparse.ArgumentParser(
+        description="Automated security stack installer for cPanel/AlmaLinux VPS"
+    )
+    parser.add_argument(
+        "--step", type=int, metavar="N",
+        help="Run only step N (1–9)"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print actions without executing"
+    )
+    parser.add_argument(
+        "--list", action="store_true",
+        help="List all steps and exit"
+    )
+    args = parser.parse_args()
+
+    DRY_RUN = args.dry_run
+
+    print(BANNER)
+
+    if args.list:
+        for i, (label, _) in enumerate(STEPS, 1):
+            print(f"  Step {i}: {label}")
+        return
+
+    if not DRY_RUN and os.geteuid() != 0:
+        err("Must be run as root. Use: sudo python3 security_installer.py")
+        sys.exit(1)
+
+    if args.step:
+        if not 1 <= args.step <= len(STEPS):
+            err(f"Invalid step: {args.step}. Valid range: 1–{len(STEPS)}")
+            sys.exit(1)
+        label, fn = STEPS[args.step - 1]
+        info(f"Running step {args.step}: {label}")
+        fn()
+        return
+
+    # Full install
+    failed = []
+    for i, (label, fn) in enumerate(STEPS, 1):
+        try:
+            fn()
+        except Exception as e:
+            err(f"Step {i} '{label}' raised: {e}")
+            failed.append(label)
+            warn("Continuing with next step...")
+
+    # Summary
+    print(f"""
+{BOLD}{GREEN}
+╔══════════════════════════════════════════════════════════════╗
+║  Installation complete.                                      ║
+╠══════════════════════════════════════════════════════════════╣
+║  Active Fail2ban jails: 7                                    ║
+║    apache-webshell      apache-php-scanner                   ║
+║    apache-credentials   apache-enum                          ║
+║    apache-config-scan   apache-wplogin                       ║
+║    sshd                                                      ║
+╠══════════════════════════════════════════════════════════════╣
+║  Manual steps:                                               ║
+║  • cPHulk: WHM > Security Center > cPHulk Brute Force        ║
+║  • Imunify360: install via WHM if licensed                   ║
+║  • Update /etc/apache2/conf.d/block-scanners.conf            ║
+║    as new attack paths are discovered                        ║
+╚══════════════════════════════════════════════════════════════╝
+{RESET}""")
+
+    if failed:
+        warn(f"Steps with errors: {', '.join(failed)}")
+        warn("Review output above and re-run with --step N if needed")
+
+
+if __name__ == "__main__":
+    main()
