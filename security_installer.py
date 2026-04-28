@@ -2,20 +2,21 @@
 """
 fail2ban-cpanel-installer
 =========================
-Automated security stack installer for cPanel / AlmaLinux 8+ / Apache VPS.
+Automated security stack installer for cPanel / AlmaLinux / Ubuntu / Debian VPS.
 
 Installs and configures:
   - ipset (hash:net blocklist, 500k entries, iptables DROP rule)
   - Fail2ban with 7 hardened jails
   - Firehol Level 1 blocklist (4,400+ malicious networks, daily cron)
-  - Apache URL blocking (webshell/scanner paths, 403 before PHP spawns)
+  - Apache-level scanner blocking (webshell/scanner paths → 403 before PHP spawns)
   - WP-Cron server-side replacement (prevents cron storms under attack)
 
 Usage:
-  python3 security_installer.py [--step N] [--dry-run]
+  python3 security_installer.py [--step N] [--dry-run] [--list]
 
 Tested on:
-  AlmaLinux 8.10 / cPanel 11.134 / Apache 2.4 / Fail2ban 1.0.2
+  AlmaLinux 8.10 / Rocky Linux 9 / Ubuntu 22.04 / Debian 12
+  cPanel 11.134 / Apache 2.4 / Fail2ban 1.0.2
 
 Author: Andrei Ghițan (dffkt432hz)
 License: MIT
@@ -27,6 +28,7 @@ import subprocess
 import glob
 import time
 import argparse
+import shutil
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
@@ -42,13 +44,16 @@ def ok(msg):   print(f"{GREEN}  ✅ {msg}{RESET}")
 def warn(msg): print(f"{YELLOW}  ⚠️  {msg}{RESET}")
 def err(msg):  print(f"{RED}  ❌ {msg}{RESET}")
 def info(msg): print(f"{CYAN}  →  {msg}{RESET}")
-def head(msg): print(f"\n{BOLD}{CYAN}{'═'*60}{RESET}\n{BOLD}  {msg}{RESET}\n{BOLD}{CYAN}{'═'*60}{RESET}")
+def head(msg): print(f"\n{BOLD}{CYAN}{'═'*62}{RESET}\n{BOLD}  {msg}{RESET}\n{BOLD}{CYAN}{'═'*62}{RESET}")
 def dry(msg):  print(f"{YELLOW}  [DRY-RUN] {msg}{RESET}")
 
 def run(cmd, check=True, capture=False):
     if DRY_RUN:
         dry(cmd)
-        class R: returncode=0; stdout=""; stderr=""
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
         return R()
     result = subprocess.run(cmd, shell=True, capture_output=capture, text=True)
     if check and result.returncode != 0:
@@ -61,7 +66,9 @@ def write_file(path, content, mode=0o644):
     if DRY_RUN:
         dry(f"Write: {path}")
         return
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     with open(path, 'w') as f:
         f.write(content)
     os.chmod(path, mode)
@@ -71,7 +78,7 @@ def append_if_missing(path, line):
     try:
         with open(path, 'r') as f:
             if line.strip() in f.read():
-                warn(f"Already present in {path}: {line.strip()}")
+                warn(f"Already present: {line.strip()}")
                 return
     except FileNotFoundError:
         pass
@@ -82,35 +89,95 @@ def append_if_missing(path, line):
         f.write(f"\n{line}\n")
     ok(f"Appended to {path}: {line.strip()}")
 
-# ── Path detection ────────────────────────────────────────────────────────────
+# ── Distro detection ──────────────────────────────────────────────────────────
+def detect_distro():
+    """Returns ('rhel', pkg_manager) or ('debian', pkg_manager)"""
+    if shutil.which("dnf"):
+        return ("rhel", "dnf")
+    if shutil.which("yum"):
+        return ("rhel", "yum")
+    if shutil.which("apt-get"):
+        return ("debian", "apt-get")
+    return ("rhel", "yum")  # fallback
+
+def detect_cpanel():
+    return os.path.exists("/usr/local/cpanel")
+
 def detect_apache_log():
-    for p in [
-        "/usr/local/apache/logs/access_log",   # cPanel default
-        "/etc/apache2/logs/access_log",
-        "/var/log/apache2/access.log",
-        "/var/log/httpd/access_log",
-    ]:
+    candidates = [
+        "/usr/local/apache/logs/access_log",   # cPanel RHEL
+        "/etc/apache2/logs/access_log",         # cPanel alt
+        "/var/log/apache2/access.log",          # Ubuntu/Debian
+        "/var/log/httpd/access_log",            # RHEL non-cPanel
+    ]
+    for p in candidates:
         if os.path.exists(p):
             return p
-    return "/usr/local/apache/logs/access_log"
+    # fallback based on distro
+    distro, _ = detect_distro()
+    return "/var/log/apache2/access.log" if distro == "debian" else "/usr/local/apache/logs/access_log"
 
 def detect_apache_conf():
-    for p in ["/etc/apache2/conf/httpd.conf", "/etc/httpd/conf/httpd.conf"]:
+    candidates = [
+        "/etc/apache2/conf/httpd.conf",    # cPanel
+        "/etc/httpd/conf/httpd.conf",      # RHEL
+        "/etc/apache2/apache2.conf",       # Ubuntu/Debian
+    ]
+    for p in candidates:
         if os.path.exists(p):
             return p
-    return "/etc/apache2/conf/httpd.conf"
+    distro, _ = detect_distro()
+    return "/etc/apache2/apache2.conf" if distro == "debian" else "/etc/httpd/conf/httpd.conf"
 
 def detect_apache_confd():
-    for p in ["/etc/apache2/conf.d", "/etc/httpd/conf.d"]:
+    candidates = [
+        "/etc/apache2/conf.d",             # cPanel / RHEL
+        "/etc/httpd/conf.d",               # RHEL non-cPanel
+        "/etc/apache2/conf-enabled",       # Ubuntu/Debian
+    ]
+    for p in candidates:
         if os.path.exists(p):
             return p
-    return "/etc/apache2/conf.d"
+    distro, _ = detect_distro()
+    return "/etc/apache2/conf-enabled" if distro == "debian" else "/etc/httpd/conf.d"
+
+def detect_apache_service():
+    """Returns service name to restart Apache"""
+    if shutil.which("apachectl"):
+        result = subprocess.run("apachectl configtest 2>&1", shell=True, capture_output=True, text=True)
+        # cPanel uses httpd
+    if os.path.exists("/usr/sbin/httpd"):
+        return "httpd"
+    if os.path.exists("/usr/sbin/apache2"):
+        return "apache2"
+    return "httpd"
 
 def detect_domlog_base():
-    for p in ["/etc/apache2/logs/domlogs", "/usr/local/apache/logs/domlogs"]:
+    candidates = [
+        "/etc/apache2/logs/domlogs",       # cPanel alt
+        "/usr/local/apache/logs/domlogs",  # cPanel standard
+    ]
+    for p in candidates:
         if os.path.exists(p):
             return p
-    return "/etc/apache2/logs/domlogs"
+    return None  # non-cPanel — use global access log
+
+def detect_ssh_log():
+    candidates = [
+        "/var/log/secure",       # RHEL/AlmaLinux
+        "/var/log/auth.log",     # Ubuntu/Debian
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    distro, _ = detect_distro()
+    return "/var/log/auth.log" if distro == "debian" else "/var/log/secure"
+
+def detect_iptables_save_path():
+    distro, _ = detect_distro()
+    if distro == "debian":
+        return None  # use iptables-save redirect
+    return "/etc/sysconfig/iptables"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,17 +186,26 @@ def detect_domlog_base():
 def step1_ipset():
     head("STEP 1 — ipset + iptables")
 
-    run("yum install -y ipset ipset-service")
-    run("systemctl enable ipset")
-    run("systemctl start ipset")
+    distro, pkg = detect_distro()
+    info(f"Detected distro family: {distro} | package manager: {pkg}")
 
+    if distro == "rhel":
+        run(f"{pkg} install -y ipset ipset-service")
+        run("systemctl enable ipset")
+        run("systemctl start ipset")
+    else:
+        run("apt-get update -qq")
+        run("apt-get install -y ipset iptables")
+
+    # Create blocklist set
     result = run("ipset list blocklist", check=False, capture=True)
     if result.returncode != 0:
         run("ipset create blocklist hash:net maxelem 500000")
         ok("Created ipset blocklist")
     else:
-        warn("ipset blocklist already exists — skipping creation")
+        warn("ipset blocklist already exists — skipping")
 
+    # iptables rules
     result = run("iptables -L INPUT -n | grep blocklist", check=False, capture=True)
     if "blocklist" not in result.stdout:
         run("iptables -I INPUT 1 -i lo -j ACCEPT")
@@ -140,8 +216,16 @@ def step1_ipset():
     else:
         warn("iptables blocklist rule already present")
 
-    run("iptables-save > /etc/sysconfig/iptables")
-    ok("iptables rules saved")
+    # Persist iptables
+    save_path = detect_iptables_save_path()
+    if save_path:
+        run(f"iptables-save > {save_path}")
+        ok(f"iptables rules saved → {save_path}")
+    else:
+        # Debian/Ubuntu — use iptables-persistent
+        run("apt-get install -y iptables-persistent", check=False)
+        run("netfilter-persistent save", check=False)
+        ok("iptables rules saved (netfilter-persistent)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,13 +233,21 @@ def step1_ipset():
 # ─────────────────────────────────────────────────────────────────────────────
 def step2_fail2ban_install():
     head("STEP 2 — Fail2ban Install")
-    run("yum install -y fail2ban")
+
+    distro, pkg = detect_distro()
+
+    if distro == "rhel":
+        run(f"{pkg} install -y fail2ban")
+    else:
+        run("apt-get update -qq")
+        run("apt-get install -y fail2ban")
+
     run("systemctl enable fail2ban")
     ok("Fail2ban installed and enabled")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 3 — Fail2ban filters (6 filter files)
+#  STEP 3 — Fail2ban filters
 # ─────────────────────────────────────────────────────────────────────────────
 def step3_filters():
     head("STEP 3 — Fail2ban Filters")
@@ -198,7 +290,7 @@ ignoreregex = ^<HOST> -.*"(GET|POST) /wp-admin/
 
         "apache-config-scan": """\
 [Definition]
-# Targets JSON config file harvesting with rotating user agents (Bloom.host attack pattern)
+# Targets JSON config file harvesting with rotating user agents
 failregex = ^<HOST> -.*"(GET|POST|HEAD) /\\.dbeaver/credentials-config\\.json HTTP
             ^<HOST> -.*"(GET|POST|HEAD) /(aws|mysql|db|postgres|mongodb|s3|secrets?|credentials?|keys)/config\\.json HTTP
             ^<HOST> -.*"(GET|POST|HEAD) /(aws|mysql)/credentials(\\.json)? HTTP
@@ -211,7 +303,7 @@ ignoreregex = ^<HOST> -.*"GET /wp-json/
 
         "apache-wplogin": """\
 [Definition]
-# wp-login.php brute force — watches all hosted domains via jail glob
+# wp-login.php brute force — watches all hosted domains via glob in jail.local
 failregex = ^<HOST> -.*"POST /wp-login\\.php
 ignoreregex =
 """,
@@ -221,27 +313,36 @@ ignoreregex =
     for name, content in filters.items():
         path = f"/etc/fail2ban/filter.d/{name}.conf"
         if os.path.exists(path) and not DRY_RUN:
-            warn(f"Filter exists: {path} — skipping (delete manually to reinstall)")
+            warn(f"Filter exists: {path} — skipping (delete to reinstall)")
         else:
             write_file(path, content)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 4 — Fail2ban jail.local (7 jails)
+#  STEP 4 — Fail2ban jail.local
 # ─────────────────────────────────────────────────────────────────────────────
 def step4_jails():
     head("STEP 4 — Fail2ban Jails (jail.local)")
 
-    apache_log   = detect_apache_log()
-    domlog_base  = detect_domlog_base()
-    info(f"Apache log detected: {apache_log}")
-    info(f"Domlog base detected: {domlog_base}")
+    apache_log  = detect_apache_log()
+    ssh_log     = detect_ssh_log()
+    domlog_base = detect_domlog_base()
+    is_cpanel   = detect_cpanel()
 
-    exts = ["ro", "com", "net", "art", "uk", "dev", "es"]
-    wplogin_logpath_lines = [f"logpath = {domlog_base}/*.{exts[0]}"]
-    for ext in exts[1:]:
-        wplogin_logpath_lines.append(f"           {domlog_base}/*.{ext}")
-    wplogin_logpath = "\n".join(wplogin_logpath_lines)
+    info(f"Apache log:  {apache_log}")
+    info(f"SSH log:     {ssh_log}")
+    info(f"cPanel:      {'yes' if is_cpanel else 'no'}")
+    info(f"Domlog base: {domlog_base or 'not found (non-cPanel — using global log)'}")
+
+    # Build wplogin logpath
+    if domlog_base and is_cpanel:
+        exts = ["ro", "com", "net", "art", "uk", "dev", "es"]
+        wplogin_lines = [f"logpath = {domlog_base}/*.{exts[0]}"]
+        for ext in exts[1:]:
+            wplogin_lines.append(f"           {domlog_base}/*.{ext}")
+        wplogin_logpath = "\n".join(wplogin_lines)
+    else:
+        wplogin_logpath = f"logpath = {apache_log}"
 
     jail_local = f"""\
 # fail2ban-cpanel-installer — jail.local
@@ -258,7 +359,7 @@ backend  = auto
 [sshd]
 enabled  = true
 port     = ssh
-logpath  = /var/log/secure
+logpath  = {ssh_log}
 maxretry = 3
 
 # ── Webshell scanning ─────────────────────────────────────────────────────────
@@ -316,7 +417,9 @@ findtime = 60
 bantime  = 86400
 action   = iptables-multiport[name=configscan, port="http,https", protocol=tcp]
 
-# ── WordPress wp-login.php brute force (all hosted domains) ──────────────────
+# ── WordPress wp-login.php brute force ────────────────────────────────────────
+# cPanel: watches all hosted domain logs via glob
+# Non-cPanel: watches global Apache access log
 [apache-wplogin]
 enabled  = true
 port     = http,https
@@ -342,6 +445,15 @@ action   = iptables-multiport[name=wplogin, port="http,https", protocol=tcp]
 # ─────────────────────────────────────────────────────────────────────────────
 def step5_firehol():
     head("STEP 5 — Firehol Blocklist")
+
+    distro, pkg = detect_distro()
+
+    # Ensure curl is available
+    if not shutil.which("curl"):
+        if distro == "rhel":
+            run(f"{pkg} install -y curl")
+        else:
+            run("apt-get install -y curl")
 
     script = """\
 #!/bin/bash
@@ -401,51 +513,63 @@ WantedBy=multi-user.target
 def step6_apache_blocking():
     head("STEP 6 — Apache URL Blocking")
 
-    confd      = detect_apache_confd()
-    conf_path  = os.path.join(confd, "block-scanners.conf")
-    apache_conf = detect_apache_conf()
+    distro, pkg  = detect_distro()
+    confd        = detect_apache_confd()
+    conf_path    = os.path.join(confd, "block-scanners.conf")
+    apache_conf  = detect_apache_conf()
+    apache_svc   = detect_apache_service()
 
     scanner_conf = """\
 # block-scanners.conf
-# Blocks known attack paths at Apache level — before PHP spawns processes.
+# Blocks known attack paths at Apache level before PHP spawns.
 # Critical during attacks: prevents php-fpm worker exhaustion.
 # https://github.com/dffkt432hz/fail2ban-cpanel-installer
 
 <IfModule mod_rewrite.c>
     RewriteEngine On
-    # Block known webshell/plugin exploit names
     RewriteCond %{REQUEST_URI} (hellopress|wp-file-manager|adminer|phpspy|c99|r57|alfa|wso|timthumb|FilesMan) [NC]
     RewriteRule .* - [F,L]
 </IfModule>
 
-# Block specific webshell filenames
 <LocationMatch "\\.php$">
     <If "%{REQUEST_URI} =~ /wso112233|ALFA_DATA|repeater|vuln|zoko|yasnu|xmu|uwu|uwa|solo1|spawns|pucci|puc|ref|one|t3s|sghb|ms-edit|wp-blog|wp-good|classwithtostring|adminfuns/">
         Require all denied
     </If>
 </LocationMatch>
 
-# Block status endpoints
 <Location "/whm-server-status">
     Require all denied
 </Location>
 
-# Block specific known-bad plugin paths
 <Location "/wp-content/plugins/hellopress/wp_filemanager.php">
     Require all denied
 </Location>
 """
-
     write_file(conf_path, scanner_conf)
-    append_if_missing(apache_conf, f"Include {conf_path}")
+
+    # On Debian/Ubuntu — enable config via a2enconf
+    if distro == "debian":
+        if shutil.which("a2enconf"):
+            run(f"a2enconf {os.path.basename(conf_path).replace('.conf','')}", check=False)
+            ok("Enabled via a2enconf")
+        else:
+            # Fallback: include in apache2.conf
+            append_if_missing(apache_conf, f"Include {conf_path}")
+    else:
+        # RHEL/cPanel: add Include to httpd.conf
+        append_if_missing(apache_conf, f"Include {conf_path}")
+
+    # Enable mod_rewrite if needed (Debian)
+    if distro == "debian" and shutil.which("a2enmod"):
+        run("a2enmod rewrite", check=False)
 
     result = run("apachectl configtest", check=False, capture=True)
     if result.returncode == 0:
         ok("Apache config test passed")
-        run("service httpd restart || systemctl restart apache2 || true")
-        ok("Apache restarted")
+        run(f"systemctl restart {apache_svc} || service {apache_svc} restart || true")
+        ok(f"Apache restarted ({apache_svc})")
     else:
-        err("Apache config test FAILED — check /etc/apache2/conf.d/block-scanners.conf")
+        err("Apache config test FAILED — check block-scanners.conf")
         if result.stderr:
             err(result.stderr.strip())
 
@@ -456,21 +580,41 @@ def step6_apache_blocking():
 def step7_wp_cron():
     head("STEP 7 — WP-Cron Hardening")
 
-    wp_configs = glob.glob("/home/*/public_html/wp-config.php")
-    info(f"Found {len(wp_configs)} WordPress installations")
+    # Find WP installs — cPanel layout and generic layout
+    search_patterns = [
+        "/home/*/public_html/wp-config.php",   # cPanel
+        "/var/www/*/wp-config.php",            # Debian/Ubuntu default
+        "/var/www/html/wp-config.php",         # single-site
+        "/srv/www/*/wp-config.php",            # openSUSE-style
+    ]
+    wp_configs = []
+    for pattern in search_patterns:
+        wp_configs.extend(glob.glob(pattern))
+    wp_configs = list(set(wp_configs))
+
+    info(f"Found {len(wp_configs)} WordPress installation(s)")
+
+    # Find php binary
+    php_bin = shutil.which("php") or "/usr/local/bin/php"
 
     cron_lines = []
     patched = skipped = 0
 
     for config_path in wp_configs:
         parts = config_path.split("/")
-        user   = parts[2]
+        # Determine the system user who owns the file
+        try:
+            stat = os.stat(config_path)
+            import pwd
+            user = pwd.getpwuid(stat.st_uid).pw_name
+        except Exception:
+            user = parts[2] if len(parts) > 2 else "www-data"
+
         wp_dir = os.path.dirname(config_path)
 
         if not DRY_RUN:
             with open(config_path, 'r') as f:
                 content = f.read()
-
             if "DISABLE_WP_CRON" not in content:
                 new_content = content.replace(
                     "<?php",
@@ -490,23 +634,27 @@ def step7_wp_cron():
         wp_cron = os.path.join(wp_dir, "wp-cron.php")
         if os.path.exists(wp_cron) or DRY_RUN:
             cron_lines.append(
-                f"*/5 * * * * {user} /usr/local/bin/php {wp_cron} > /dev/null 2>&1"
+                f"*/5 * * * * {user} {php_bin} {wp_cron} > /dev/null 2>&1"
             )
 
     if not DRY_RUN:
         info(f"Patched: {patched} | Already done: {skipped}")
 
     if cron_lines:
-        content = "# WP-Cron server-side replacement\n# Generated by fail2ban-cpanel-installer\n"
+        content = (
+            "# WP-Cron server-side replacement\n"
+            "# Generated by fail2ban-cpanel-installer\n"
+            "# https://github.com/dffkt432hz/fail2ban-cpanel-installer\n\n"
+        )
         content += "\n".join(cron_lines) + "\n"
         write_file("/etc/cron.d/wp-cron-all", content)
-        ok(f"Server-side WP cron written ({len(cron_lines)} sites)")
+        ok(f"Server-side WP cron written ({len(cron_lines)} site(s))")
     else:
-        warn("No WP installations found — /etc/cron.d/wp-cron-all not created")
+        warn("No WP installations found — skipping WP-Cron step")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 8 — Start Fail2ban + verify jails
+#  STEP 8 — Start Fail2ban + verify
 # ─────────────────────────────────────────────────────────────────────────────
 def step8_start_fail2ban():
     head("STEP 8 — Start & Verify Fail2ban")
@@ -519,7 +667,7 @@ def step8_start_fail2ban():
         print(result.stdout)
     else:
         err("Fail2ban failed to start")
-        err("Check: journalctl -u fail2ban -n 50")
+        err("Check: journalctl -u fail2ban -n 50 --no-pager")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -529,15 +677,14 @@ def step9_verify():
     head("STEP 9 — Final Verification")
 
     checks = [
-        ("ipset blocklist",          "ipset list blocklist | grep 'Number of entries'"),
-        ("iptables DROP rule",        "iptables -L INPUT -n -v | grep blocklist"),
-        ("Fail2ban jails",            "fail2ban-client status"),
-        ("Firehol cron",              "cat /etc/cron.d/firehol-blocklist"),
-        ("Apache URL blocking",       "curl -s -o /dev/null -w '%{http_code}' http://localhost/whm-server-status"),
-        ("WP-Cron server cron",       "wc -l /etc/cron.d/wp-cron-all 2>/dev/null || echo 'not created'"),
+        ("ipset blocklist",        "ipset list blocklist | grep 'Number of entries'"),
+        ("iptables DROP rule",     "iptables -L INPUT -n -v | grep blocklist"),
+        ("Fail2ban jails",         "fail2ban-client status"),
+        ("Firehol cron",           "cat /etc/cron.d/firehol-blocklist"),
+        ("Apache URL blocking",    "curl -s -o /dev/null -w '%{http_code}' http://localhost/whm-server-status"),
+        ("WP-Cron server cron",    "wc -l /etc/cron.d/wp-cron-all 2>/dev/null || echo 'not created (no WP installs found)'"),
     ]
 
-    all_ok = True
     for label, cmd in checks:
         result = run(cmd, check=False, capture=True)
         if result.returncode == 0 and result.stdout.strip():
@@ -545,9 +692,6 @@ def step9_verify():
             info(result.stdout.strip()[:200])
         else:
             warn(f"{label} — check manually")
-            all_ok = False
-
-    return all_ok
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,18 +712,20 @@ STEPS = [
 BANNER = f"""\
 {BOLD}{CYAN}
 ╔══════════════════════════════════════════════════════════════╗
-║   fail2ban-cpanel-installer                                  ║
-║   Automated VPS Security Stack for cPanel / AlmaLinux        ║
+║   fail2ban-cpanel-installer  v2                              ║
+║   Automated VPS Security Stack                               ║
+║   AlmaLinux · Rocky · RHEL · Ubuntu · Debian                 ║
+║   cPanel & standalone Apache                                 ║
 ║   github.com/dffkt432hz/fail2ban-cpanel-installer            ║
 ╚══════════════════════════════════════════════════════════════╝
 {RESET}
 Installs:
-  • ipset blocklist (500k entry capacity, iptables DROP)
-  • Fail2ban with 7 hardened jails
+  • ipset blocklist (500k capacity, iptables DROP)
+  • Fail2ban — 7 hardened jails:
       apache-webshell | apache-php-scanner | apache-credentials
       apache-enum | apache-config-scan | apache-wplogin | sshd
-  • Firehol Level 1 blocklist (4,400+ malicious networks)
-  • Apache URL blocking (webshell/scanner paths → 403)
+  • Firehol Level 1 blocklist (4,400+ malicious networks, daily refresh)
+  • Apache URL blocking (scanners → 403, before PHP spawns)
   • WP-Cron server-side replacement (prevents cron storms)
 """
 
@@ -587,24 +733,14 @@ def main():
     global DRY_RUN
 
     parser = argparse.ArgumentParser(
-        description="Automated security stack installer for cPanel/AlmaLinux VPS"
+        description="Automated security stack installer — cPanel/AlmaLinux/Ubuntu/Debian"
     )
-    parser.add_argument(
-        "--step", type=int, metavar="N",
-        help="Run only step N (1–9)"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print actions without executing"
-    )
-    parser.add_argument(
-        "--list", action="store_true",
-        help="List all steps and exit"
-    )
+    parser.add_argument("--step", type=int, metavar="N", help="Run only step N (1–9)")
+    parser.add_argument("--dry-run", action="store_true", help="Print actions without executing")
+    parser.add_argument("--list", action="store_true", help="List all steps and exit")
     args = parser.parse_args()
 
     DRY_RUN = args.dry_run
-
     print(BANNER)
 
     if args.list:
@@ -613,19 +749,18 @@ def main():
         return
 
     if not DRY_RUN and os.geteuid() != 0:
-        err("Must be run as root. Use: sudo python3 security_installer.py")
+        err("Must be run as root.  sudo python3 security_installer.py")
         sys.exit(1)
 
     if args.step:
         if not 1 <= args.step <= len(STEPS):
-            err(f"Invalid step: {args.step}. Valid range: 1–{len(STEPS)}")
+            err(f"Invalid step: {args.step}. Valid: 1–{len(STEPS)}")
             sys.exit(1)
         label, fn = STEPS[args.step - 1]
         info(f"Running step {args.step}: {label}")
         fn()
         return
 
-    # Full install
     failed = []
     for i, (label, fn) in enumerate(STEPS, 1):
         try:
@@ -635,7 +770,6 @@ def main():
             failed.append(label)
             warn("Continuing with next step...")
 
-    # Summary
     print(f"""
 {BOLD}{GREEN}
 ╔══════════════════════════════════════════════════════════════╗
@@ -644,20 +778,17 @@ def main():
 ║  Active Fail2ban jails: 7                                    ║
 ║    apache-webshell      apache-php-scanner                   ║
 ║    apache-credentials   apache-enum                          ║
-║    apache-config-scan   apache-wplogin                       ║
-║    sshd                                                      ║
+║    apache-config-scan   apache-wplogin   sshd                ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Manual steps:                                               ║
-║  • cPHulk: WHM > Security Center > cPHulk Brute Force        ║
+║  Remaining manual steps:                                     ║
+║  • cPHulk (cPanel): WHM > Security Center > cPHulk           ║
 ║  • Imunify360: install via WHM if licensed                   ║
-║  • Update /etc/apache2/conf.d/block-scanners.conf            ║
-║    as new attack paths are discovered                        ║
+║  • Update block-scanners.conf as new attacks emerge          ║
 ╚══════════════════════════════════════════════════════════════╝
 {RESET}""")
 
     if failed:
         warn(f"Steps with errors: {', '.join(failed)}")
-        warn("Review output above and re-run with --step N if needed")
 
 
 if __name__ == "__main__":
