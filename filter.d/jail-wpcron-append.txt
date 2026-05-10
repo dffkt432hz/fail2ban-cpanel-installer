@@ -1,0 +1,16 @@
+
+[apache-wpcron-abuse]
+enabled = true
+port = http,https
+filter = apache-wpcron-abuse
+logpath = /etc/apache2/logs/domlogs/*.ro
+          /etc/apache2/logs/domlogs/*.com
+          /etc/apache2/logs/domlogs/*.net
+          /etc/apache2/logs/domlogs/*.art
+          /etc/apache2/logs/domlogs/*.uk
+          /etc/apache2/logs/domlogs/*.dev
+          /etc/apache2/logs/domlogs/*.es
+maxretry = 20
+findtime = 60
+bantime = 604800
+action = iptables-multiport[name=wpcronabuse, port="http,https", protocol=tcp]
