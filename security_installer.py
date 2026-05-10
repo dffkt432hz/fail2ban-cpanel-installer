@@ -6,7 +6,7 @@ Automated security stack installer for cPanel / AlmaLinux / Ubuntu / Debian VPS.
 
 Installs and configures:
   - ipset (hash:net blocklist, 500k entries, iptables DROP rule)
-  - Fail2ban with 7 hardened jails
+  - Fail2ban with 8 hardened jails
   - Firehol Level 1 blocklist (4,400+ malicious networks, daily cron)
   - Apache-level scanner blocking (webshell/scanner paths → 403 before PHP spawns)
   - WP-Cron server-side replacement (prevents cron storms under attack)
@@ -29,6 +29,7 @@ import glob
 import time
 import argparse
 import shutil
+import socket
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
@@ -89,6 +90,29 @@ def append_if_missing(path, line):
         f.write(f"\n{line}\n")
     ok(f"Appended to {path}: {line.strip()}")
 
+def get_server_ip():
+    """Get the primary public IP of this server."""
+    try:
+        result = subprocess.run(
+            "curl -s --max-time 5 https://api.ipify.org || "
+            "curl -s --max-time 5 https://ifconfig.me || "
+            "hostname -I | awk '{print $1}'",
+            shell=True, capture_output=True, text=True
+        )
+        ip = result.stdout.strip().split()[0]
+        if ip:
+            return ip
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return ""
+
 # ── Distro detection ──────────────────────────────────────────────────────────
 def detect_distro():
     """Returns ('rhel', pkg_manager) or ('debian', pkg_manager)"""
@@ -113,7 +137,6 @@ def detect_apache_log():
     for p in candidates:
         if os.path.exists(p):
             return p
-    # fallback based on distro
     distro, _ = detect_distro()
     return "/var/log/apache2/access.log" if distro == "debian" else "/usr/local/apache/logs/access_log"
 
@@ -142,10 +165,6 @@ def detect_apache_confd():
     return "/etc/apache2/conf-enabled" if distro == "debian" else "/etc/httpd/conf.d"
 
 def detect_apache_service():
-    """Returns service name to restart Apache"""
-    if shutil.which("apachectl"):
-        result = subprocess.run("apachectl configtest 2>&1", shell=True, capture_output=True, text=True)
-        # cPanel uses httpd
     if os.path.exists("/usr/sbin/httpd"):
         return "httpd"
     if os.path.exists("/usr/sbin/apache2"):
@@ -176,8 +195,14 @@ def detect_ssh_log():
 def detect_iptables_save_path():
     distro, _ = detect_distro()
     if distro == "debian":
-        return None  # use iptables-save redirect
+        return None
     return "/etc/sysconfig/iptables"
+
+def detect_ipset_save_path():
+    distro, _ = detect_distro()
+    if distro == "debian":
+        return None
+    return "/etc/sysconfig/ipset"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,12 +230,14 @@ def step1_ipset():
     else:
         warn("ipset blocklist already exists — skipping")
 
-    # iptables rules
+    # iptables rules — localhost + RFC1918 always allowed first
     result = run("iptables -L INPUT -n | grep blocklist", check=False, capture=True)
     if "blocklist" not in result.stdout:
         run("iptables -I INPUT 1 -i lo -j ACCEPT")
         run("iptables -I INPUT 2 -s 127.0.0.0/8 -j ACCEPT")
         run("iptables -I INPUT 3 -s 10.0.0.0/8 -j ACCEPT")
+        run("iptables -I INPUT 4 -s 172.16.0.0/12 -j ACCEPT")
+        run("iptables -I INPUT 5 -s 192.168.0.0/16 -j ACCEPT")
         run("iptables -A INPUT -m set --match-set blocklist src -j DROP")
         ok("iptables DROP rule added")
     else:
@@ -222,10 +249,15 @@ def step1_ipset():
         run(f"iptables-save > {save_path}")
         ok(f"iptables rules saved → {save_path}")
     else:
-        # Debian/Ubuntu — use iptables-persistent
         run("apt-get install -y iptables-persistent", check=False)
         run("netfilter-persistent save", check=False)
         ok("iptables rules saved (netfilter-persistent)")
+
+    # Persist ipset
+    ipset_save = detect_ipset_save_path()
+    if ipset_save:
+        run(f"ipset save > {ipset_save}")
+        ok(f"ipset saved → {ipset_save}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,7 +269,12 @@ def step2_fail2ban_install():
     distro, pkg = detect_distro()
 
     if distro == "rhel":
-        run(f"{pkg} install -y fail2ban")
+        # EPEL required for Fail2ban on RHEL/AlmaLinux/Rocky
+        result = run("rpm -q epel-release", check=False, capture=True)
+        if result.returncode != 0:
+            run(f"{pkg} install -y epel-release")
+            ok("EPEL repository installed")
+        run(f"{pkg} install -y fail2ban fail2ban-systemd")
     else:
         run("apt-get update -qq")
         run("apt-get install -y fail2ban")
@@ -256,7 +293,7 @@ def step3_filters():
 
         "apache-webshell": """\
 [Definition]
-failregex = ^<HOST> -.*"(GET|POST|HEAD) .*\\.(php|asp|aspx|jsp|cgi|pl|py|sh|bash|cmd|exe|cfm|shtml)\\?.*= HTTP
+failregex = ^<HOST> -.*"(GET|POST|HEAD) .*\.(php|asp|aspx|jsp|cgi|pl|py|sh|bash|cmd|exe|cfm|shtml)\?.*= HTTP
             ^<HOST> -.*"(GET|POST|HEAD) .*(shell|webshell|cmd|eval|base64|passwd|shadow|etc/passwd) HTTP
             ^<HOST> -.*"(GET|POST|HEAD) .*(c99|r57|b374k|wso|alfa|indoxploit|symlink|bypass) HTTP
 ignoreregex =
@@ -268,34 +305,37 @@ failregex = ^<HOST> -.*"(GET|POST) /.*.php.* HTTP/.*" 404
             ^<HOST> -.*"(GET|POST) /wp-content/plugins/.*.php HTTP
             ^<HOST> -.*"(GET|POST) /wp-includes/.*.php HTTP
 ignoreregex = ^<HOST> -.*"GET /wp-admin/
-              ^<HOST> -.*"GET /wp-content/themes/.*\\.php HTTP
+              ^<HOST> -.*"GET /wp-content/themes/.*\.php HTTP
 """,
 
         "apache-credentials": """\
 [Definition]
-failregex = ^<HOST> -.*"(GET|POST|HEAD) /\\.env HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /(wp-config\\.php|wp-config\\.bak|wp-config\\.txt) HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /\\.git/(config|HEAD|index) HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /(aws|\\.aws)/credentials HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /\\.ssh/(id_rsa|authorized_keys|known_hosts) HTTP
+failregex = ^<HOST> -.*"(GET|POST|HEAD) /\.env HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(wp-config\.php|wp-config\.bak|wp-config\.txt) HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /\.git/(config|HEAD|index) HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(aws|\.aws)/credentials HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /\.ssh/(id_rsa|authorized_keys|known_hosts) HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(secrets|credentials|serviceAccountKey)\.json HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /\.aws/credentials HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(api/\.env|backend/\.env|app/\.env) HTTP
 ignoreregex =
 """,
 
         "apache-enum": """\
 [Definition]
 failregex = ^<HOST> -.*"(GET|POST|HEAD) .*(admin|administrator|phpmyadmin|pma|myadmin|mysql|adminer) HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /xmlrpc\\.php HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /xmlrpc\.php HTTP
 ignoreregex = ^<HOST> -.*"(GET|POST) /wp-admin/
 """,
 
         "apache-config-scan": """\
 [Definition]
 # Targets JSON config file harvesting with rotating user agents
-failregex = ^<HOST> -.*"(GET|POST|HEAD) /\\.dbeaver/credentials-config\\.json HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /(aws|mysql|db|postgres|mongodb|s3|secrets?|credentials?|keys)/config\\.json HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /(aws|mysql)/credentials(\\.json)? HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /config\\.(prod|dev|staging|production)\\.json HTTP
-            ^<HOST> -.*"(GET|POST|HEAD) /assets/config\\.production\\.json HTTP
+failregex = ^<HOST> -.*"(GET|POST|HEAD) /\.dbeaver/credentials-config\.json HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(aws|mysql|db|postgres|mongodb|s3|secrets?|credentials?|keys)/config\.json HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /(aws|mysql)/credentials(\.json)? HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /config\.(prod|dev|staging|production)\.json HTTP
+            ^<HOST> -.*"(GET|POST|HEAD) /assets/config\.production\.json HTTP
 ignoreregex = ^<HOST> -.*"GET /wp-json/
               ^<HOST> -.*"GET /wp-content/
               ^<HOST> -.*"GET /wp-admin/
@@ -304,7 +344,17 @@ ignoreregex = ^<HOST> -.*"GET /wp-json/
         "apache-wplogin": """\
 [Definition]
 # wp-login.php brute force — watches all hosted domains via glob in jail.local
-failregex = ^<HOST> -.*"POST /wp-login\\.php
+failregex = ^<HOST> -.*"POST /wp-login\.php
+ignoreregex =
+""",
+
+        "apache-wpcron-abuse": """\
+[Definition]
+# wp-cron.php flood prevention
+# Legitimate cron is triggered server-side (server IP whitelisted via ignoreip)
+# External IPs hammering wp-cron.php are bots or compromised servers
+# Real-world catch: 167.86.93.191 sent 61,992 wp-cron requests from a Contabo server
+failregex = ^<HOST> -.*"GET /wp-cron\.php
 ignoreregex =
 """,
 
@@ -328,21 +378,33 @@ def step4_jails():
     ssh_log     = detect_ssh_log()
     domlog_base = detect_domlog_base()
     is_cpanel   = detect_cpanel()
+    server_ip   = get_server_ip()
 
     info(f"Apache log:  {apache_log}")
     info(f"SSH log:     {ssh_log}")
     info(f"cPanel:      {'yes' if is_cpanel else 'no'}")
     info(f"Domlog base: {domlog_base or 'not found (non-cPanel — using global log)'}")
+    info(f"Server IP:   {server_ip or 'could not detect'}")
 
-    # Build wplogin logpath
-    if domlog_base and is_cpanel:
-        exts = ["ro", "com", "net", "art", "uk", "dev", "es"]
-        wplogin_lines = [f"logpath = {domlog_base}/*.{exts[0]}"]
-        for ext in exts[1:]:
-            wplogin_lines.append(f"           {domlog_base}/*.{ext}")
-        wplogin_logpath = "\n".join(wplogin_lines)
-    else:
-        wplogin_logpath = f"logpath = {apache_log}"
+    # Build ignoreip — always include localhost + server's own IP
+    ignoreip_parts = ["127.0.0.1/8", "::1"]
+    if server_ip:
+        ignoreip_parts.append(server_ip)
+    ignoreip = " ".join(ignoreip_parts)
+
+    # Build domlog-aware logpath for multi-domain jails
+    exts = ["ro", "com", "net", "art", "uk", "dev", "es"]
+
+    def build_domlog_logpath(base, indent="           "):
+        if base and is_cpanel:
+            lines = [f"logpath = {base}/*.{exts[0]}"]
+            for ext in exts[1:]:
+                lines.append(f"{indent}{base}/*.{ext}")
+            return "\n".join(lines)
+        return f"logpath = {apache_log}"
+
+    wplogin_logpath  = build_domlog_logpath(domlog_base)
+    wpcron_logpath   = build_domlog_logpath(domlog_base)
 
     jail_local = f"""\
 # fail2ban-cpanel-installer — jail.local
@@ -350,6 +412,8 @@ def step4_jails():
 # https://github.com/dffkt432hz/fail2ban-cpanel-installer
 
 [DEFAULT]
+# Never ban these IPs — localhost, server's own IP, and any home/office IPs you add
+ignoreip = {ignoreip}
 bantime  = 86400
 findtime = 600
 maxretry = 5
@@ -361,6 +425,8 @@ enabled  = true
 port     = ssh
 logpath  = {ssh_log}
 maxretry = 3
+findtime = 60
+bantime  = 604800
 
 # ── Webshell scanning ─────────────────────────────────────────────────────────
 [apache-webshell]
@@ -429,6 +495,20 @@ maxretry = 3
 findtime = 60
 bantime  = 86400
 action   = iptables-multiport[name=wplogin, port="http,https", protocol=tcp]
+
+# ── WordPress wp-cron.php flood ───────────────────────────────────────────────
+# Server's own IP is whitelisted via ignoreip above — only external abusers banned
+# cPanel: watches all hosted domain logs via glob
+# Non-cPanel: watches global Apache access log
+[apache-wpcron-abuse]
+enabled  = true
+port     = http,https
+filter   = apache-wpcron-abuse
+{wpcron_logpath}
+maxretry = 20
+findtime = 60
+bantime  = 604800
+action   = iptables-multiport[name=wpcronabuse, port="http,https", protocol=tcp]
 """
 
     jail_path = "/etc/fail2ban/jail.local"
@@ -448,7 +528,6 @@ def step5_firehol():
 
     distro, pkg = detect_distro()
 
-    # Ensure curl is available
     if not shutil.which("curl"):
         if distro == "rhel":
             run(f"{pkg} install -y curl")
@@ -467,7 +546,14 @@ LOGFILE=/var/log/firehol-blocklist.log
 echo "[$(date)] Updating Firehol blocklist..." >> "$LOGFILE"
 
 curl -s https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset \\
-  | grep -v "^#" | grep -v "^$" > "$TMPFILE"
+  | grep -v "^#" | grep -v "^$" \\
+  | grep -v "^127\\." \\
+  | grep -v "^10\\." \\
+  | grep -v "^192\\.168\\." \\
+  | grep -v "^172\\.1[6-9]\\." \\
+  | grep -v "^172\\.2[0-9]\\." \\
+  | grep -v "^172\\.3[0-1]\\." \\
+  > "$TMPFILE"
 
 COUNT=$(wc -l < "$TMPFILE")
 
@@ -537,31 +623,38 @@ def step6_apache_blocking():
     </If>
 </LocationMatch>
 
+# Block common server status probes
 <Location "/whm-server-status">
     Require all denied
 </Location>
 
+# Block known vulnerable plugin paths
 <Location "/wp-content/plugins/hellopress/wp_filemanager.php">
     Require all denied
 </Location>
+
+# Block PHPUnit exploitation path (CVE widely abused)
+<LocationMatch "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin\\.php">
+    Require all denied
+</LocationMatch>
+
+# Block direct server IP access (scanners hit raw IP, not domain)
+<If "%{HTTP_HOST} == '%SERVER_ADDR%'">
+    Require all denied
+</If>
 """
     write_file(conf_path, scanner_conf)
 
-    # On Debian/Ubuntu — enable config via a2enconf
     if distro == "debian":
         if shutil.which("a2enconf"):
             run(f"a2enconf {os.path.basename(conf_path).replace('.conf','')}", check=False)
             ok("Enabled via a2enconf")
         else:
-            # Fallback: include in apache2.conf
             append_if_missing(apache_conf, f"Include {conf_path}")
+        if shutil.which("a2enmod"):
+            run("a2enmod rewrite", check=False)
     else:
-        # RHEL/cPanel: add Include to httpd.conf
         append_if_missing(apache_conf, f"Include {conf_path}")
-
-    # Enable mod_rewrite if needed (Debian)
-    if distro == "debian" and shutil.which("a2enmod"):
-        run("a2enmod rewrite", check=False)
 
     result = run("apachectl configtest", check=False, capture=True)
     if result.returncode == 0:
@@ -580,7 +673,6 @@ def step6_apache_blocking():
 def step7_wp_cron():
     head("STEP 7 — WP-Cron Hardening")
 
-    # Find WP installs — cPanel layout and generic layout
     search_patterns = [
         "/home/*/public_html/wp-config.php",   # cPanel
         "/var/www/*/wp-config.php",            # Debian/Ubuntu default
@@ -594,7 +686,6 @@ def step7_wp_cron():
 
     info(f"Found {len(wp_configs)} WordPress installation(s)")
 
-    # Find php binary
     php_bin = shutil.which("php") or "/usr/local/bin/php"
 
     cron_lines = []
@@ -602,7 +693,6 @@ def step7_wp_cron():
 
     for config_path in wp_configs:
         parts = config_path.split("/")
-        # Determine the system user who owns the file
         try:
             stat = os.stat(config_path)
             import pwd
@@ -683,6 +773,7 @@ def step9_verify():
         ("Firehol cron",           "cat /etc/cron.d/firehol-blocklist"),
         ("Apache URL blocking",    "curl -s -o /dev/null -w '%{http_code}' http://localhost/whm-server-status"),
         ("WP-Cron server cron",    "wc -l /etc/cron.d/wp-cron-all 2>/dev/null || echo 'not created (no WP installs found)'"),
+        ("Fail2ban wpcron jail",   "fail2ban-client status apache-wpcron-abuse"),
     ]
 
     for label, cmd in checks:
@@ -712,7 +803,7 @@ STEPS = [
 BANNER = f"""\
 {BOLD}{CYAN}
 ╔══════════════════════════════════════════════════════════════╗
-║   fail2ban-cpanel-installer  v2                              ║
+║   fail2ban-cpanel-installer  v2.1                            ║
 ║   Automated VPS Security Stack                               ║
 ║   AlmaLinux · Rocky · RHEL · Ubuntu · Debian                 ║
 ║   cPanel & standalone Apache                                 ║
@@ -721,9 +812,10 @@ BANNER = f"""\
 {RESET}
 Installs:
   • ipset blocklist (500k capacity, iptables DROP)
-  • Fail2ban — 7 hardened jails:
-      apache-webshell | apache-php-scanner | apache-credentials
-      apache-enum | apache-config-scan | apache-wplogin | sshd
+  • Fail2ban — 8 hardened jails:
+      apache-webshell      | apache-php-scanner   | apache-credentials
+      apache-enum          | apache-config-scan   | apache-wplogin
+      apache-wpcron-abuse  | sshd
   • Firehol Level 1 blocklist (4,400+ malicious networks, daily refresh)
   • Apache URL blocking (scanners → 403, before PHP spawns)
   • WP-Cron server-side replacement (prevents cron storms)
@@ -775,12 +867,14 @@ def main():
 ╔══════════════════════════════════════════════════════════════╗
 ║  Installation complete.                                      ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Active Fail2ban jails: 7                                    ║
+║  Active Fail2ban jails: 8                                    ║
 ║    apache-webshell      apache-php-scanner                   ║
 ║    apache-credentials   apache-enum                          ║
-║    apache-config-scan   apache-wplogin   sshd                ║
+║    apache-config-scan   apache-wplogin                       ║
+║    apache-wpcron-abuse  sshd                                 ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Remaining manual steps:                                     ║
+║  • Add your home/office IP to ignoreip in jail.local         ║
 ║  • cPHulk (cPanel): WHM > Security Center > cPHulk           ║
 ║  • Imunify360: install via WHM if licensed                   ║
 ║  • Update block-scanners.conf as new attacks emerge          ║
