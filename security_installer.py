@@ -238,7 +238,7 @@ def step1_ipset():
         run("iptables -I INPUT 3 -s 10.0.0.0/8 -j ACCEPT")
         run("iptables -I INPUT 4 -s 172.16.0.0/12 -j ACCEPT")
         run("iptables -I INPUT 5 -s 192.168.0.0/16 -j ACCEPT")
-        run("iptables -A INPUT -m set --match-set blocklist src -j DROP")
+        run("iptables -I INPUT 6 -m set --match-set blocklist src -j DROP")
         ok("iptables DROP rule added")
     else:
         warn("iptables blocklist rule already present")
@@ -419,6 +419,10 @@ findtime = 600
 maxretry = 5
 backend  = auto
 
+# Use ipset for all bans — integrates with existing blocklist ipset
+banaction = iptables-ipset-proto6-allports
+banaction_allports = iptables-ipset-proto6-allports
+
 # ── SSH ───────────────────────────────────────────────────────────────────────
 [sshd]
 enabled  = true
@@ -437,7 +441,7 @@ logpath  = {apache_log}
 maxretry = 2
 findtime = 60
 bantime  = 86400
-action   = iptables-multiport[name=webshell, port="http,https", protocol=tcp]
+banaction = iptables-ipset-proto6-allports
 
 # ── PHP scanner (404 probing for vulnerable plugins/themes) ───────────────────
 [apache-php-scanner]
@@ -448,7 +452,7 @@ logpath  = {apache_log}
 maxretry = 1
 findtime = 60
 bantime  = 86400
-action   = iptables-multiport[name=phpscanner, port="http,https", protocol=tcp]
+banaction = iptables-ipset-proto6-allports
 
 # ── Credential harvesting (.env, wp-config, .git, aws/credentials) ───────────
 [apache-credentials]
@@ -459,7 +463,7 @@ logpath  = {apache_log}
 maxretry = 2
 findtime = 60
 bantime  = 86400
-action   = iptables-multiport[name=credentials, port="http,https", protocol=tcp]
+banaction = iptables-ipset-proto6-allports
 
 # ── Admin enumeration (phpmyadmin, xmlrpc, adminer) ──────────────────────────
 [apache-enum]
@@ -470,7 +474,7 @@ logpath  = {apache_log}
 maxretry = 5
 findtime = 60
 bantime  = 86400
-action   = iptables-multiport[name=enum, port="http,https", protocol=tcp]
+banaction = iptables-ipset-proto6-allports
 
 # ── JSON config file harvesting ───────────────────────────────────────────────
 [apache-config-scan]
@@ -481,7 +485,7 @@ logpath  = {apache_log}
 maxretry = 5
 findtime = 60
 bantime  = 86400
-action   = iptables-multiport[name=configscan, port="http,https", protocol=tcp]
+banaction = iptables-ipset-proto6-allports
 
 # ── WordPress wp-login.php brute force ────────────────────────────────────────
 # cPanel: watches all hosted domain logs via glob
