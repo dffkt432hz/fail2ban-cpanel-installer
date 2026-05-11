@@ -7,7 +7,7 @@
 
 **Automated security stack installer for cPanel / AlmaLinux VPS servers.**
 
-Deploys a production-hardened defense layer in a single command — ipset blocklist with **iptables DROP as rule #1**, 8 Fail2ban jails using **ipset-based blocking** (not multiport chains), Firehol Level 1 network blocklist, Apache-level scanner blocking, and WP-Cron hardening.
+Deploys a production-hardened defense layer in a single command — ipset blocklist with **iptables DROP as rule #1**, 9 Fail2ban jails using **ipset-based blocking** (not multiport chains), Firehol Level 1 network blocklist, Apache-level scanner blocking, and WP-Cron hardening.
 
 Battle-tested against a sustained coordinated cyberattack: **750,000+ malicious requests, 500+ IPs, 7 simultaneous threat actors** — server load kept under control, zero breaches.
 
@@ -18,7 +18,7 @@ Battle-tested against a sustained coordinated cyberattack: **750,000+ malicious 
 | Component | Details |
 |---|---|
 | **ipset** | `hash:net` blocklist, 500k entry capacity, **iptables DROP inserted as rule #1** |
-| **Fail2ban** | 8 hardened jails, all using `iptables-ipset-proto6-allports` action |
+| **Fail2ban** | 9 hardened jails, all using `iptables-ipset-proto6-allports` action |
 | **Firehol Level 1** | 4,400+ known malicious networks blocked at kernel level, daily cron refresh |
 | **Apache URL blocking** | Webshell/scanner paths return 403 before PHP ever spawns — kills load spikes |
 | **WP-Cron hardening** | Replaces per-request cron with server-side cron — prevents cron storms under attack |
@@ -37,6 +37,7 @@ Battle-tested against a sustained coordinated cyberattack: **750,000+ malicious 
 | `apache-config-scan` | JSON config file harvesting with rotating user agents | 5 | 24h | ipset |
 | `apache-wplogin` | `wp-login.php` brute force across **all hosted domains** | 3 | 24h | multiport |
 | `apache-wpcron-abuse` | `wp-cron.php` flooding from external IPs | 20 | 7 days | multiport |
+| `apache-wpscan` | WPScan tool, plugin/theme readme enumeration, user enumeration via `?author=` | 2 | 24h | ipset |
 
 > **All jails use `iptables-ipset-proto6-allports`** (kernel-level ipset DROP) by default.  
 > This is a critical fix over older configurations that used `iptables-multiport` — those created phantom bans that appeared active in fail2ban but never actually dropped packets at the firewall.
