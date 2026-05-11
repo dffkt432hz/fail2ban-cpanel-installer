@@ -358,6 +358,19 @@ failregex = ^<HOST> -.*"GET /wp-cron\.php
 ignoreregex =
 """,
 
+        "apache-wpscan": """\
+[Definition]
+# WPScan tool detection, plugin/theme readme enumeration, user enumeration
+failregex = ^<HOST> .* "(GET|POST|HEAD) .*" .* "WPScan.*"
+            ^<HOST> .* "(GET|POST|HEAD) .*" .* "WordPress Security Scanner.*"
+            ^<HOST> .* "(GET|POST|HEAD) /wp-content/plugins/.*/readme\.txt.*" .*
+            ^<HOST> .* "(GET|POST|HEAD) /wp-content/themes/.*/readme\.txt.*" .*
+            ^<HOST> .* "(GET|POST|HEAD) /wp-json/wp/v2/users.*" .*
+            ^<HOST> .* "(GET|POST|HEAD) /\?author=[0-9]+.*" .*
+            ^<HOST> .* "(GET|POST|HEAD) .*wp-login\.php\?action=register.*" .*
+ignoreregex =
+""",
+
     }
 
     for name, content in filters.items():
@@ -513,6 +526,17 @@ maxretry = 20
 findtime = 60
 bantime  = 604800
 action   = iptables-multiport[name=wpcronabuse, port="http,https", protocol=tcp]
+
+# ── WPScan / WordPress enumeration ───────────────────────────────────────────
+[apache-wpscan]
+enabled  = true
+port     = http,https
+filter   = apache-wpscan
+logpath  = {apache_log}
+maxretry = 2
+findtime = 60
+bantime  = 86400
+banaction = iptables-ipset-proto6-allports
 """
 
     jail_path = "/etc/fail2ban/jail.local"
