@@ -1,150 +1,160 @@
 # fail2ban-cpanel-installer
 
-Production-hardened Fail2ban configuration for cPanel servers (AlmaLinux / CentOS 8+).
-Built and battle-tested during a sustained multi-wave cyberattack campaign (April–May 2026)
-against a 35-site cPanel/Apache server running 750,000+ malicious requests from 30+ threat actors.
+[![Python](https://img.shields.io/badge/python-3.6%2B-blue)](https://python.org)
+[![Platform](https://img.shields.io/badge/platform-AlmaLinux%20%7C%20Rocky%20%7C%20Ubuntu%20%7C%20Debian-lightgrey)](https://github.com/dffkt432hz/fail2ban-cpanel-installer)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Battle tested](https://img.shields.io/badge/battle--tested-750k%2B%20requests-red)](https://github.com/dffkt432hz/fail2ban-cpanel-installer)
+
+**Automated security stack installer for cPanel / AlmaLinux VPS servers.**
+
+Deploys a production-hardened defense layer in a single command — ipset blocklist with **iptables DROP as rule #1**, 8 Fail2ban jails using **ipset-based blocking** (not multiport chains), Firehol Level 1 network blocklist, Apache-level scanner blocking, and WP-Cron hardening.
+
+Battle-tested against a sustained coordinated cyberattack: **750,000+ malicious requests, 500+ IPs, 7 simultaneous threat actors** — server load kept under control, zero breaches.
 
 ---
 
-## Jails
+## What it installs
 
-| Jail | Filter | maxretry | findtime | bantime | Watches |
-|------|--------|----------|----------|---------|---------|
-| `apache-webshell` | PHP webshell names | 2 | 60s | 24h | domlogs |
-| `apache-php-scanner` | PHP scanner patterns | 2 | 60s | 24h | access_log |
-| `apache-credentials` | .env / AWS / wp-config harvesting | 2 | 60s | 24h | domlogs |
-| `apache-enum` | CMS path enumeration | 2 | 60s | 24h | domlogs |
-| `apache-config-scan` | JSON config file harvesting | 2 | 60s | 24h | domlogs |
-| `apache-wplogin` | WordPress wp-login.php brute force | 3 | 60s | 24h | domlogs |
-| `apache-wpcron-abuse` | WordPress wp-cron.php flood | 20 | 60s | 7 days | domlogs |
-| `sshd` | SSH brute force | 2 | 60s | 7 days | /var/log/secure |
+| Component | Details |
+|---|---|
+| **ipset** | `hash:net` blocklist, 500k entry capacity, **iptables DROP inserted as rule #1** |
+| **Fail2ban** | 8 hardened jails, all using `iptables-ipset-proto6-allports` action |
+| **Firehol Level 1** | 4,400+ known malicious networks blocked at kernel level, daily cron refresh |
+| **Apache URL blocking** | Webshell/scanner paths return 403 before PHP ever spawns — kills load spikes |
+| **WP-Cron hardening** | Replaces per-request cron with server-side cron — prevents cron storms under attack |
 
 ---
 
-## Filters
+## Fail2ban jails (8)
 
-### apache-webshell
-Catches requests for known PHP webshell filenames:
-`alfa, c99, r57, wso, webshell, wp_filemanager, classwithtostring, adminfuns` and many others.
+| Jail | Targets | maxretry | bantime | Action |
+|---|---|---|---|---|
+| `sshd` | SSH brute force | 3 | 7 days | ipset |
+| `apache-webshell` | Webshell upload attempts, known shell names | 2 | 24h | ipset |
+| `apache-php-scanner` | PHP 404 probing for vulnerable plugins/themes | 1 | 24h | ipset |
+| `apache-credentials` | `.env`, `wp-config`, `.git/config`, `aws/credentials` harvesting | 2 | 24h | ipset |
+| `apache-enum` | phpMyAdmin, xmlrpc.php, adminer enumeration | 5 | 24h | ipset |
+| `apache-config-scan` | JSON config file harvesting with rotating user agents | 5 | 24h | ipset |
+| `apache-wplogin` | `wp-login.php` brute force across **all hosted domains** | 3 | 24h | multiport |
+| `apache-wpcron-abuse` | `wp-cron.php` flooding from external IPs | 20 | 7 days | multiport |
 
-### apache-php-scanner
-Catches automated PHP scanner tools probing for vulnerable PHP files across multiple paths.
-
-### apache-credentials
-Catches credential harvesting sweeps targeting:
-- `.env` variants (`.env.local`, `.env.production`, `.env.docker`, etc.)
-- `aws/credentials`, `wp-config.php.bak`, `s3_config.json`
-- `application.yml`, `settings.yml`, `appsettings.json`
-
-### apache-enum
-Catches CMS path enumeration targeting:
-- `/ALFA_DATA/`, `/admin/fckeditor/`, `/vendor/phpunit/`
-- `/sites/default/files/`, `/images/stories/`
-
-### apache-config-scan
-Catches JSON config file harvesting:
-- `/.dbeaver/credentials-config.json`
-- `/aws/config.json`, `/mysql/credentials`
-- `/config.prod.json`, `/assets/config.production.json`
-
-Ignores: `/wp-json/`, `/wp-content/`, `/wp-admin/` (legitimate WP traffic).
-
-### apache-wplogin
-Catches brute force attacks on `/wp-login.php` via POST requests.
-
-### apache-wpcron-abuse
-Catches automated flooding of `/wp-cron.php`. Legitimate cron hits come from the server
-itself (already whitelisted via `ignoreip`). External IPs hitting wp-cron repeatedly
-are bots or compromised servers — banned for 7 days on the 20th hit within 60 seconds.
-
-Real-world catch: `167.86.93.191` sent **61,992 wp-cron requests** from a Contabo server
-before this jail was deployed.
+> **All jails use `iptables-ipset-proto6-allports`** (kernel-level ipset DROP) by default.  
+> This is a critical fix over older configurations that used `iptables-multiport` — those created phantom bans that appeared active in fail2ban but never actually dropped packets at the firewall.
 
 ---
 
-## Installation
+## iptables rule order
+
+The installer places the blocklist DROP as **rule #1** in the INPUT chain — before any ACCEPT rules. This ensures all 4,400+ Firehol networks and manually blocked IPs are dropped at the kernel level without reaching Apache.
+
+```
+Chain INPUT (policy ACCEPT)
+DROP    all  -- 0.0.0.0/0  0.0.0.0/0  match-set blocklist src       ← Rule #1
+REJECT  tcp  -- 0.0.0.0/0  0.0.0.0/0  match-set f2b-apache-webshell src
+REJECT  tcp  -- 0.0.0.0/0  0.0.0.0/0  match-set f2b-apache-credentials src
+...
+```
+
+---
+
+## Requirements
+
+- AlmaLinux 8+ / Rocky Linux 8+ / RHEL 8+ / Ubuntu 22.04+ / Debian 12+
+- cPanel / WHM (tested on 11.130+)
+- Apache 2.4
+- Python 3.6+
+- Root access
+
+---
+
+## Quick start
 
 ```bash
-# Clone the repo
-git clone https://github.com/dffkt432hz/fail2ban-cpanel-installer.git
-cd fail2ban-cpanel-installer
+wget https://raw.githubusercontent.com/dffkt432hz/fail2ban-cpanel-installer/main/security_installer.py
+python3 security_installer.py
+```
 
-# Copy filter files
-cp filter.d/*.conf /etc/fail2ban/filter.d/
+### Options
 
-# Append jail config (review first)
-cat jail.local >> /etc/fail2ban/jail.local
-
-# Reload Fail2ban
-fail2ban-client reload
-
-# Verify all jails are active
-fail2ban-client status
+```bash
+python3 security_installer.py --list        # Show all steps
+python3 security_installer.py --dry-run     # Preview without changes
+python3 security_installer.py --step 4      # Run only step 4 (Fail2ban jails)
 ```
 
 ---
 
-## Important: ignoreip
+## Steps
 
-Always add your server's own IP to `ignoreip` in `[DEFAULT]`:
-
-```ini
-[DEFAULT]
-ignoreip = 127.0.0.1/8 ::1 YOUR.HOME.IP.HERE YOUR.SERVER.IP.HERE
-```
-
-This prevents your server from banning itself when running staggered wp-cron jobs
-or any other internal HTTP requests. Failure to do this caused real issues during
-wp-cron storm containment.
+| Step | What it does |
+|---|---|
+| 1 | Install & configure ipset — create `blocklist` ipset, insert DROP as iptables rule #1 |
+| 2 | Install & configure Fail2ban |
+| 3 | Write Fail2ban filter files (8 filters) |
+| 4 | Write `jail.local` with all 8 jails using ipset-based actions |
+| 5 | Install Firehol Level 1 blocklist + daily cron |
+| 6 | Configure Apache URL blocking (webshell/scanner paths → 403) |
+| 7 | WP-Cron hardening (`DISABLE_WP_CRON` across all WordPress installs) |
 
 ---
 
-## Recommended complementary setup
+## Verify everything is working
 
-These jails work best alongside:
+```bash
+# All 8 jails active
+fail2ban-client status | grep "Jail list"
 
-1. **ipset + Firehol Level 1 blocklist** — drops known bad IPs at kernel level before
-   Apache even sees the request. Firehol runs daily at 03:00 via cron.
+# iptables chains — should show f2b-* ipset REJECT rules + blocklist DROP at top
+iptables -L INPUT -n | grep -E "blocklist|f2b"
 
-2. **block_azure.py** — blocks all 41,747+ Azure IPv4 prefixes via ipset. Useful if
-   your server is not a Microsoft customer and you want to drop Azure scanning entirely.
-   Includes dynamic Exchange Online exclusion so outbound mail still works.
+# Blocklist size
+ipset list blocklist | grep "Number of entries"
 
-3. **ModSecurity OWASP CRS** — application-layer WAF running in front of Fail2ban.
-   Catches and 403s attacks before they hit PHP. Note: ModSecurity blocks to
-   `error_log`, not `access_log` — Fail2ban won't see these unless you add a
-   dedicated error_log jail (TODO item).
-
-4. **Apache rate limiting for high-value targets** — if a specific site is repeatedly
-   targeted (e.g. andradadesign.ro), add per-vhost config:
-
-```apache
-<IfModule mod_limitipconn.c>
-    MaxConnPerIP 10
-</IfModule>
-<Location /wp-login.php>
-    <IfModule mod_ratelimit.c>
-        SetOutputFilter RATE_LIMIT
-        SetEnv rate-limit 400
-    </IfModule>
-</Location>
-<Location /xmlrpc.php>
-    Require all denied
-</Location>
+# Active bans per jail
+for jail in apache-webshell apache-php-scanner apache-credentials apache-enum apache-config-scan apache-wplogin apache-wpcron-abuse sshd; do
+  echo -n "$jail: "
+  fail2ban-client status $jail | grep "Currently banned"
+done
 ```
 
 ---
 
-## Tested on
+## Common issues
 
-- AlmaLinux 8.10
-- cPanel 11.134
-- Apache 2.4.67 (EasyApache4)
-- Fail2ban 1.0.2
-- ModSecurity 2.9.12 with OWASP CRS 3.3.9
+**Jail shows "Currently banned: N" but IPs still reach Apache**  
+Old configurations used `iptables-multiport` which creates named chains but may not wire correctly. This installer uses `iptables-ipset-proto6-allports` — each jail gets its own ipset (`f2b-apache-credentials`, etc.) with a REJECT rule in INPUT. Verify with `iptables -L | grep f2b`.
+
+**blocklist DROP rule missing after reboot**  
+The installer saves iptables to `/etc/sysconfig/iptables` (RHEL) or via `netfilter-persistent` (Debian/Ubuntu) and installs a systemd service to restore the Firehol blocklist on boot. If rules don't survive reboot, run `systemctl enable firehol-blocklist.service`.
+
+**Fail2ban ban chains not appearing in iptables**  
+Chains are only created when the first IP is banned. Force-test: `fail2ban-client set apache-credentials banip 1.2.3.4 && iptables -L | grep f2b && fail2ban-client set apache-credentials unbanip 1.2.3.4`
+
+---
+
+## File locations
+
+| File | Purpose |
+|---|---|
+| `/etc/fail2ban/jail.local` | Main jail configuration |
+| `/etc/fail2ban/filter.d/apache-*.conf` | Custom filter files |
+| `/usr/local/bin/firehol-blocklist.sh` | Blocklist refresh script |
+| `/etc/cron.d/firehol-blocklist` | Daily 3am cron for blocklist refresh |
+| `/etc/sysconfig/ipset` | Persisted ipset state (RHEL-family) |
+| `/etc/sysconfig/iptables` | Persisted iptables rules (RHEL-family) |
+
+---
+
+## Background
+
+Built and battle-tested during a sustained multi-wave cyberattack campaign (April–May 2026) against a 39-site cPanel/Apache server running WordPress. The attack generated 750,000+ malicious requests from 30+ threat actors across 7 attack waves — webshell scanning, credential harvesting, PHP scanner floods, JSON config harvesting, wp-login brute force, and wp-cron storms.
+
+The server was never compromised. This installer encodes everything learned during that defense.
+
+A criminal complaint was filed with ZAC Bayern (case `BY0257-500359-26/8`), abuse reports submitted to AbuseIPDB, and ISP abuse notifications sent to Microsoft, Hetzner, Contabo, and others.
 
 ---
 
 ## License
 
-MIT
+MIT — Andrei Ghițan
