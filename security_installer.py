@@ -6,7 +6,7 @@ Automated security stack installer for cPanel / AlmaLinux / Ubuntu / Debian VPS.
 
 Installs and configures:
   - ipset (hash:net blocklist, 500k entries, iptables DROP rule)
-  - Fail2ban with 8 hardened jails
+  - Fail2ban with 10 hardened jails
   - Firehol Level 1 blocklist (4,400+ malicious networks, daily cron)
   - Apache-level scanner blocking (webshell/scanner paths → 403 before PHP spawns)
   - WP-Cron server-side replacement (prevents cron storms under attack)
@@ -371,6 +371,17 @@ failregex = ^<HOST> .* "(GET|POST|HEAD) .*" .* "WPScan.*"
 ignoreregex =
 """,
 
+
+        "apache-phpunit": """\[Definition]
+# PHPUnit RCE (CVE-2017-9841) + ThinkPHP RCE detection
+# Catches eval-stdin.php exploitation and ThinkPHP invokefunction RCE
+# Real-world: 5,690 attempts logged across attack campaign April-June 2026
+failregex = ^<HOST> .* "(GET|POST) .*eval-stdin\.php
+            ^<HOST> .* "(GET|POST) .*phpunit.*Util/PHP
+            ^<HOST> .* "(GET|POST) .*invokefunction&function=call_user_func
+ignoreregex =
+""",
+
     }
 
     for name, content in filters.items():
@@ -537,6 +548,19 @@ maxretry = 2
 findtime = 60
 bantime  = 86400
 banaction = iptables-ipset-proto6-allports
+
+# ── PHPUnit RCE + ThinkPHP RCE ────────────────────────────────────────────────
+[apache-phpunit]
+enabled   = true
+port      = http,https
+filter    = apache-phpunit
+logpath   = {apache_log}
+maxretry  = 2
+findtime  = 60
+bantime   = 604800
+banaction = iptables-ipset-proto6-allports
+"""
+
 """
 
     jail_path = "/etc/fail2ban/jail.local"
@@ -670,6 +694,14 @@ def step6_apache_blocking():
 <If "%{HTTP_HOST} == '%SERVER_ADDR%'">
     Require all denied
 </If>
+
+# Block visionheight commercial scanner
+SetEnvIf User-Agent "visionheight" bad_bot
+<Location "/">
+  Order Allow,Deny
+  Allow from all
+  Deny from env=bad_bot
+</Location>
 """
     write_file(conf_path, scanner_conf)
 
@@ -831,7 +863,7 @@ STEPS = [
 BANNER = f"""\
 {BOLD}{CYAN}
 ╔══════════════════════════════════════════════════════════════╗
-║   fail2ban-cpanel-installer  v2.1                            ║
+║   fail2ban-cpanel-installer  v2.2                            ║
 ║   Automated VPS Security Stack                               ║
 ║   AlmaLinux · Rocky · RHEL · Ubuntu · Debian                 ║
 ║   cPanel & standalone Apache                                 ║
@@ -840,10 +872,11 @@ BANNER = f"""\
 {RESET}
 Installs:
   • ipset blocklist (500k capacity, iptables DROP)
-  • Fail2ban — 8 hardened jails:
+  • Fail2ban — 10 hardened jails:
       apache-webshell      | apache-php-scanner   | apache-credentials
       apache-enum          | apache-config-scan   | apache-wplogin
-      apache-wpcron-abuse  | sshd
+      apache-wpcron-abuse  | apache-wpscan
+      apache-phpunit       | sshd
   • Firehol Level 1 blocklist (4,400+ malicious networks, daily refresh)
   • Apache URL blocking (scanners → 403, before PHP spawns)
   • WP-Cron server-side replacement (prevents cron storms)
@@ -895,11 +928,12 @@ def main():
 ╔══════════════════════════════════════════════════════════════╗
 ║  Installation complete.                                      ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Active Fail2ban jails: 8                                    ║
+║  Active Fail2ban jails: 10                                    ║
 ║    apache-webshell      apache-php-scanner                   ║
 ║    apache-credentials   apache-enum                          ║
 ║    apache-config-scan   apache-wplogin                       ║
-║    apache-wpcron-abuse  sshd                                 ║
+║    apache-wpcron-abuse  apache-wpscan
+║    apache-phpunit       sshd                                 ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Remaining manual steps:                                     ║
 ║  • Add your home/office IP to ignoreip in jail.local         ║
@@ -915,3 +949,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
