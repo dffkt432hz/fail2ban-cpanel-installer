@@ -563,8 +563,6 @@ bantime   = 604800
 banaction = iptables-ipset-proto6-allports
 """
 
-"""
-
     jail_path = "/etc/fail2ban/jail.local"
     if os.path.exists(jail_path) and not DRY_RUN:
         backup = f"{jail_path}.bak.{int(time.time())}"
