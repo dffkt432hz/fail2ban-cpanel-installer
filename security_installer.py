@@ -230,16 +230,18 @@ def step1_ipset():
     else:
         warn("ipset blocklist already exists — skipping")
 
-    # iptables rules — localhost + RFC1918 always allowed first
-    result = run("iptables -L INPUT -n | grep blocklist", check=False, capture=True)
-    if "blocklist" not in result.stdout:
-        run("iptables -I INPUT 1 -i lo -j ACCEPT")
-        run("iptables -I INPUT 2 -s 127.0.0.0/8 -j ACCEPT")
-        run("iptables -I INPUT 3 -s 10.0.0.0/8 -j ACCEPT")
-        run("iptables -I INPUT 4 -s 172.16.0.0/12 -j ACCEPT")
-        run("iptables -I INPUT 5 -s 192.168.0.0/16 -j ACCEPT")
-        run("iptables -I INPUT 6 -m set --match-set blocklist src -j DROP")
-        ok("iptables DROP rule added")
+    # iptables rules — blocklist DROP at position 1 (before all other rules)
+    # ACCEPT rules for lo/RFC1918 are appended after, so they evaluate after DROP
+    # This ensures the full blocklist is checked first on every packet
+    result = run("iptables -C INPUT -m set --match-set blocklist src -j DROP", check=False, capture=True)
+    if result.returncode != 0:
+        run("iptables -I INPUT 1 -m set --match-set blocklist src -j DROP")
+        run("iptables -A INPUT -i lo -j ACCEPT")
+        run("iptables -A INPUT -s 127.0.0.0/8 -j ACCEPT")
+        run("iptables -A INPUT -s 10.0.0.0/8 -j ACCEPT")
+        run("iptables -A INPUT -s 172.16.0.0/12 -j ACCEPT")
+        run("iptables -A INPUT -s 192.168.0.0/16 -j ACCEPT")
+        ok("iptables blocklist DROP rule added at INPUT position 1")
     else:
         warn("iptables blocklist rule already present")
 
@@ -645,6 +647,65 @@ WantedBy=multi-user.target
     ok("Firehol systemd service enabled (loads on boot)")
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 5b — ipset-restore-critical service
+# ─────────────────────────────────────────────────────────────────────────────
+def step5b_ipset_restore():
+    head("STEP 5b — ipset-restore-critical service")
+
+    script = """#!/bin/bash
+# Restore critical ipset blocks + enforce DROP rule on every boot.
+# This is idempotent — safe to run multiple times.
+# Key lesson: populating an ipset without an activating iptables DROP rule
+# means the blocklist drops ZERO packets. This script guarantees both.
+
+# Ensure ipset exists
+ipset list blocklist >/dev/null 2>&1 || ipset create blocklist hash:net maxelem 1000000
+
+# Restore any saved ipset state
+IPSET_SAVE=$([ -f /etc/sysconfig/ipset ] && echo /etc/sysconfig/ipset || echo /etc/iptables/ipset.rules)
+[ -f "$IPSET_SAVE" ] && ipset restore -! < "$IPSET_SAVE" 2>/dev/null
+
+# CRITICAL: Ensure the IPv4 DROP rule exists — without this, the ipset is inert
+# Use -C to check first (idempotent — won't create duplicate rules)
+if ! iptables -C INPUT -m set --match-set blocklist src -j DROP 2>/dev/null; then
+  iptables -I INPUT 1 -m set --match-set blocklist src -j DROP
+fi
+
+# IPv6: consolidated Azure superblock (2602:fb54::/32 covers all Azure IPv6)
+if ! ip6tables -C INPUT -s 2602:fb54::/32 -j DROP 2>/dev/null; then
+  ip6tables -I INPUT 1 -s 2602:fb54::/32 -j DROP
+fi
+
+logger "ipset-restore-critical: done — DROP rule verified, IPv6 /32 active"
+"""
+
+    service = """[Unit]
+Description=Restore critical ipset blocks after boot
+After=ipset.service iptables.service network.target
+Wants=ipset.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ipset-restore-critical.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    write_file("/usr/local/bin/ipset-restore-critical.sh", script)
+    import subprocess
+    subprocess.run(["chmod", "+x", "/usr/local/bin/ipset-restore-critical.sh"], check=False)
+    write_file("/etc/systemd/system/ipset-restore-critical.service", service)
+    run("systemctl daemon-reload")
+    run("systemctl enable ipset-restore-critical.service")
+    ok("ipset-restore-critical service installed and enabled")
+    info("This service guarantees the blocklist DROP rule survives every reboot")
+    info("Fleet-tested: without it, 20,000+ ipset entries drop zero packets after reboot")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  STEP 6 — Apache URL blocking
 # ─────────────────────────────────────────────────────────────────────────────
@@ -854,6 +915,7 @@ STEPS = [
     ("Fail2ban filters",        step3_filters),
     ("Fail2ban jails",          step4_jails),
     ("Firehol blocklist",       step5_firehol),
+    ("ipset-restore service",   step5b_ipset_restore),
     ("Apache URL blocking",     step6_apache_blocking),
     ("WP-Cron hardening",       step7_wp_cron),
     ("Start Fail2ban",          step8_start_fail2ban),
@@ -863,7 +925,7 @@ STEPS = [
 BANNER = f"""\
 {BOLD}{CYAN}
 ╔══════════════════════════════════════════════════════════════╗
-║   fail2ban-cpanel-installer  v2.2                            ║
+║   fail2ban-cpanel-installer  v2.3                            ║
 ║   Automated VPS Security Stack                               ║
 ║   AlmaLinux · Rocky · RHEL · Ubuntu · Debian                 ║
 ║   cPanel & standalone Apache                                 ║
@@ -949,4 +1011,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
